@@ -1,7 +1,6 @@
-# Same packages as environment-latest.yml, pinned to the versions that resolved
+# pinned the latest versions that resolved
 # in a working env (mint_latest, October 2026). Use this to reproduce that env;
-# use environment-latest.yml to re-resolve against current releases.
-name: mint-latest
+name: mint
 channels:
   - conda-forge
   - bioconda
