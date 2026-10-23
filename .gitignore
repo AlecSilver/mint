@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environment
 venv/
+.venv/
 .env/
 .envrc
 *.env
@@ -41,3 +42,7 @@ test.ipynb
 
 *.ckpt
 *.pt
+
+# data files
+data/
+interaction_head/data/
