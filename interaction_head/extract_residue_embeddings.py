@@ -14,7 +14,9 @@ and the labels are cropped with the same window.
 Output: --out-dir/shard_00000.pt, shard_00001.pt, ...  Each shard is a dict:
     ids           list[str]            pair ids, in input order
     cluster       int64  [P]
-    emb           float16 [N, 1280]    residue embeddings, flat over all pairs
+    layers        list[int]            MINT layers saved, in the order of emb's dim 1
+    emb           float16 [N, K, 1280] residue embeddings for K = len(layers) layers,
+                                       flat over all pairs
                                        (pair p = rows offsets[p]:offsets[p+1],
                                         chain-1 residues first, then chain-2)
     labels        int8   [N]           1 interface / 0 not / -1 unresolved
@@ -25,16 +27,23 @@ Output: --out-dir/shard_00000.pt, shard_00001.pt, ...  Each shard is a dict:
     full_len      int32  [P, 2]        uncropped lengths of seq1 / seq2
 
 Shards that already exist are skipped, so an interrupted run can be resumed.
+--out-dir/meta.json records the settings that change shard contents (layers, crop, ...);
+resuming into a folder made with different settings is refused.
+
+Layer 33 (the final one) has MINT's last layer norm applied; layers 1-32 are raw, so their
+scales differ. Saving several layers costs K x the disk/RAM of one.
 
 Usage (in the mint conda env, from interaction_head/):
     python extract_residue_embeddings.py data/trainset.json data/emb_train/ --limit 200   # quick test
     python extract_residue_embeddings.py data/trainset.json data/emb_train/
     python extract_residue_embeddings.py data/trainset.json data/emb_train/ --labeled-only
+    python extract_residue_embeddings.py data/trainset.json data/emb_l24-33/ --layers 24 28 33
 
 Loading for training:
     shard = torch.load("data/emb_train/shard_00000.pt")
     keep = shard["labels"] >= 0
-    X, y = shard["emb"][keep].float(), shard["labels"][keep]
+    X, y = shard["emb"][keep].float(), shard["labels"][keep]      # X: [n, K, 1280]
+    X24 = X[:, shard["layers"].index(24)]                           # one layer: [n, 1280]
 """
 import argparse
 import itertools
@@ -136,13 +145,13 @@ def token_batches(items, max_tokens):
 
 
 @torch.no_grad()
-def embed_shard(items, model, alphabet, device, max_tokens, layer, labeled_only):
+def embed_shard(items, model, alphabet, device, max_tokens, layers, labeled_only):
     per_item = [None] * len(items)
     for idx in token_batches(items, max_tokens):
         batch = [items[i] for i in idx]
         tokens, chain_ids, widths = encode_batch(batch, alphabet)
-        reps = model(tokens.to(device), chain_ids.to(device), repr_layers=[layer])["representations"][layer]
-        reps = reps.to(torch.float16).cpu()
+        out = model(tokens.to(device), chain_ids.to(device), repr_layers=layers)["representations"]
+        reps = torch.stack([out[l] for l in layers], dim=2).to(torch.float16).cpu()  # [B, T, K, D]
         for b, i in enumerate(idx):
             it = items[i]
             parts = []
@@ -164,6 +173,7 @@ def embed_shard(items, model, alphabet, device, max_tokens, layer, labeled_only)
     flat = [p for parts in per_item for p in parts]
     return {
         "ids": [it["id"] for it in items],
+        "layers": list(layers),
         "cluster": torch.tensor([it["cluster"] for it in items], dtype=torch.int64),
         "emb": torch.cat([p[0] for p in flat]),
         "labels": torch.cat([p[1] for p in flat]),
@@ -175,6 +185,24 @@ def embed_shard(items, model, alphabet, device, max_tokens, layer, labeled_only)
     }
 
 
+def check_meta(out_dir, meta):
+    """Write out_dir/meta.json, or refuse if existing shards were made with other settings."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "meta.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            old = json.load(f)
+        diff = {k: (old.get(k), v) for k, v in meta.items() if old.get(k) != v}
+        if diff:
+            raise SystemExit(f"{out_dir} was made with different settings (old, new): {diff}\n"
+                             "use a new output folder, or delete it to start over")
+    elif any(n.startswith("shard_") for n in os.listdir(out_dir)):
+        raise SystemExit(f"{out_dir} has shards from an older version of this script (no meta.json); "
+                         "use a new output folder")
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", help="JSONL from label_interfaces.py (e.g. trainset.json)")
@@ -182,20 +210,27 @@ def main():
     parser.add_argument("--checkpoint", default=os.path.join(REPO_DIR, "mint.ckpt"))
     parser.add_argument("--config", default=os.path.join(REPO_DIR, "data", "esm2_t33_650M_UR50D.json"))
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--layer", type=int, default=33, help="layer to extract (33 = final, as in MINTWrapper)")
+    parser.add_argument("--layers", "--layer", type=int, nargs="+", default=[33],
+                        help="layer(s) to extract, e.g. --layers 24 28 33 (33 = final, as in MINTWrapper)")
     parser.add_argument("--max-res", type=int, default=510, help="max residues per chain (510 + <cls>/<eos> = 512)")
     parser.add_argument("--crop", choices=["random", "interface", "center", "start"], default="random",
                         help="window for chains longer than --max-res; 'random' is seeded per pair id")
     parser.add_argument("--max-tokens", type=int, default=4096, help="token budget per forward pass")
     parser.add_argument("--shard-size", type=int, default=200,
-                        help="pairs per output shard (each pair holds up to ~2.6 MB of embeddings in RAM)")
+                        help="pairs per output shard (each pair holds up to ~2.6 MB of embeddings "
+                             "per saved layer in RAM)")
     parser.add_argument("--labeled-only", action="store_true", help="drop residues with label -1")
     parser.add_argument("--fp32", action="store_true", help="run the model in fp32 (default fp16)")
     parser.add_argument("--limit", type=int, help="only process the first N pairs")
     args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
     cfg = load_config(args.config)
+    layers = sorted(set(args.layers))
+    if not all(0 <= l <= cfg.encoder_layers for l in layers):
+        parser.error(f"--layers must be between 0 and {cfg.encoder_layers}")
+    check_meta(args.out_dir, {"input": os.path.abspath(args.input), "layers": layers,
+                              "max_res": args.max_res, "crop": args.crop,
+                              "labeled_only": args.labeled_only, "shard_size": args.shard_size})
     # Cast before loading and mmap the checkpoint: MINTWrapper holds the fp32
     # model and the full 3.2 GB checkpoint in memory at once (~6 GB), which
     # overflows both a 6 GB GPU and the WSL VM's RAM
@@ -221,7 +256,7 @@ def main():
             if not os.path.exists(path):
                 items = [prepare(rec, args.max_res, args.crop) for rec in chunk]
                 shard = embed_shard(items, model, alphabet, args.device, args.max_tokens,
-                                    args.layer, args.labeled_only)
+                                    layers, args.labeled_only)
                 torch.save(shard, path + ".tmp")
                 os.replace(path + ".tmp", path)
             pbar.update(len(chunk))
