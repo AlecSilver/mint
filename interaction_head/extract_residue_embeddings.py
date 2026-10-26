@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Extract per-residue MINT embeddings for labelled protein pairs, aligned with
-the per-residue interface labels from label_interfaces.py.
+the per-residue interface labels from interface/label_interfaces.py.
 
 Input: JSONL, one line per pair (trainset.json), either
-    from label_interfaces.py:
+    from interface/label_interfaces.py:
     {"id": ..., "cluster": ..., "seq1": ..., "seq2": ..., "labels1": [...], "labels2": [...]}
-    or from label_contacts.py (per-residue labels are derived from it: 1 = in any listed
+    or from contact/label_contacts.py (per-residue labels are derived from it: 1 = in any listed
     contact, 0 = resolved, -1 = not):
     {"id": ..., "cluster": ..., "seq1": ..., "seq2": ..., "resolved1": [...], "resolved2": [...],
      "contacts": [[i, j, d], ...]}

@@ -31,8 +31,8 @@ are ignored.
 Metrics: average precision over all val cells, and per-pair precision of the top 10, L/10
 and L/5 predictions (L = shorter chain), the usual inter-chain contact metrics.
 
-Usage (any env with torch >= 2.1, e.g. Colab):
-    python train_contact_head.py \\
+Usage (any env with torch >= 2.1, e.g. Colab; from interaction_head/):
+    python contact/train_contact_head.py \\
         --train-emb data/emb_train --train-contacts data/trainset_contacts.json \\
         --val-emb data/emb_val --val-contacts data/validset_contacts.json \\
         --out runs/add_h128

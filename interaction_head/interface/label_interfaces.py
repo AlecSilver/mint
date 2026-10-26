@@ -24,9 +24,9 @@ Setup (separate, modern env; not the Python 3.7 MINT env):
     pip install gemmi scipy numpy
 
 Usage (from interaction_head/, after ./load_data.sh):
-    python label_interfaces.py data/PPLM_Dataset/trainset.PDB.txt data/trainset.json \\
+    python interface/label_interfaces.py data/PPLM_Dataset/trainset.PDB.txt data/trainset.json \\
         --seq-dir data/PPLM_Dataset/PDB_seqs
-    python label_interfaces.py dimers.csv data/labels.json --cutoff 8.0
+    python interface/label_interfaces.py dimers.csv data/labels.json --cutoff 8.0
 """
 import argparse
 import csv
@@ -39,7 +39,7 @@ import gemmi
 import numpy as np
 from scipy.spatial import cKDTree
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")  # interaction_head/data
 
 PAIR_RE =re.compile(r"([0-9A-Za-z]{4})-assembly(\d+)_([^_\s,;]+)_([^_\s,;]+)")
 

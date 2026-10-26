@@ -11,8 +11,8 @@ strings with --keep-labels). Row order matches the input, so row i of the CSV
 is embedding i from MINT.
 
 Usage (from interaction_head/):
-    python jsonl_to_mint_csv.py data/trainset.json data/trainset.csv
-    python jsonl_to_mint_csv.py data/trainset.json data/trainset.csv --keep-labels
+    python interface/jsonl_to_mint_csv.py data/trainset.json data/trainset.csv
+    python interface/jsonl_to_mint_csv.py data/trainset.json data/trainset.csv --keep-labels
 
 Then:
     dataset = CSVDataset('data/trainset.csv', 'seq1', 'seq2')
