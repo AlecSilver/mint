@@ -29,17 +29,27 @@ With --seq-dir pointing at PPLM's PDB_seqs folder, seq1/seq2 are the sequences f
 Setup (separate, modern env; not the Python 3.7 MINT env):
     pip install gemmi scipy numpy
 
+--per-cluster N labels at most N random pairs from each PPLM cluster (pairs in a cluster are
+near-duplicates; --seed picks which). A pair that fails is replaced by another from its cluster.
+
+Runs are resumable: re-running with the same output file skips pairs already labelled or
+already listed in <output>.failed.txt (--retry-failed tries those again), so an interrupted run
+can just be started again. The settings are saved to <output>.meta.json, and resuming with
+different ones is refused.
+
 Usage (from interaction_head/, after ./load_data.sh):
     python contact/label_contacts.py data/PPLM_Dataset/trainset.PDB.txt data/trainset_contacts.json \\
-        --seq-dir data/PPLM_Dataset/PDB_seqs
+        --seq-dir data/PPLM_Dataset/PDB_seqs --per-cluster 1
     python contact/label_contacts.py dimers.csv data/contacts.json --cutoff 20.0
 """
 import argparse
 import csv
 import json
 import os
+import random
 import re
 import urllib.request
+from collections import Counter
 
 import gemmi
 import numpy as np
@@ -51,7 +61,7 @@ PAIR_RE =re.compile(r"([0-9A-Za-z]{4})-assembly(\d+)_([^_\s,;]+)_([^_\s,;]+)")
 
 
 # ---------------------------------------------------------------- input parsing
-def read_pairs(path):
+def read_pairs(path, per_cluster=None, seed=0):
     """Yield dicts: name, pdb_id, assembly (None = asymmetric unit), chain1, chain2, cluster."""
     if path.lower().endswith(".csv"):
         with open(path) as f:
@@ -60,9 +70,13 @@ def read_pairs(path):
                 yield dict(name=f"{pdb_id}_{c1}_{c2}", pdb_id=pdb_id, assembly=None,
                            chain1=c1, chain2=c2, cluster=i)
         return
+    rng = random.Random(seed)
     with open(path) as f:
         for cluster, line in enumerate(l for l in f if l.strip()):
-            for m in PAIR_RE.finditer(line):
+            pairs = list(PAIR_RE.finditer(line))
+            if per_cluster:
+                rng.shuffle(pairs)  # main() takes the first per_cluster that succeed
+            for m in pairs:
                 yield dict(name=m.group(0), pdb_id=m.group(1), assembly=m.group(2),
                            chain1=m.group(3), chain2=m.group(4), cluster=cluster)
 
@@ -75,7 +89,8 @@ def fetch_cif(pdb_id, assembly, cache_dir):
     path = os.path.join(cache_dir, f"{stem}.cif.gz")
     if not os.path.exists(path):
         url_stem = f"{pdb_id.lower()}-assembly{assembly}" if assembly else pdb_id.upper()
-        urllib.request.urlretrieve(f"https://files.rcsb.org/download/{url_stem}.cif.gz", path)
+        urllib.request.urlretrieve(f"https://files.rcsb.org/download/{url_stem}.cif.gz", path + ".part")
+        os.replace(path + ".part", path)  # an interrupted download never looks complete
     return path
 
 
@@ -199,6 +214,51 @@ def transfer_contacts(ij, d, index1, index2):
     return np.stack([i[ok], j[ok]], axis=1), d[ok]
 
 
+# ---------------------------------------------------------------- resuming
+def resume(out_path, failed_path, meta, retry_failed):
+    """(ids an earlier run into out_path already handled, labelled pairs per cluster); empty for a new run."""
+    meta_path = out_path + ".meta.json"
+    if not os.path.exists(out_path):
+        if os.path.exists(failed_path):
+            os.remove(failed_path)  # don't leave a stale report from an earlier run
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        return set(), Counter()
+
+    if not os.path.exists(meta_path):
+        raise SystemExit(f"{out_path} exists but has no {os.path.basename(meta_path)} (made by an older "
+                         "version of this script); delete it or write to a new file")
+    with open(meta_path) as f:
+        old = json.load(f)
+    diff = {k: (old.get(k), v) for k, v in meta.items() if old.get(k) != v}
+    if diff:
+        raise SystemExit(f"{out_path} was made with other settings (old, new): {diff}; "
+                         "delete it or write to a new file")
+
+    done, per_cluster, good = set(), Counter(), 0
+    with open(out_path, "rb") as f:
+        for line in f:
+            if not line.endswith(b"\n"):
+                break  # cut off by a crash
+            rec = json.loads(line)
+            done.add(rec["id"])
+            per_cluster[rec["cluster"]] += 1
+            good += len(line)
+    os.truncate(out_path, good)
+    n_failed = 0
+    if os.path.exists(failed_path):
+        if retry_failed:
+            os.remove(failed_path)
+        else:
+            with open(failed_path) as f:
+                failed = {l.split("\t")[0] for l in f if l.endswith("\n")}
+            n_failed = len(failed)
+            done |= failed
+    print(f"resuming: {len(done) - n_failed} pairs already labelled, {n_failed} failed earlier"
+          + (" (skipped; --retry-failed to try again)" if n_failed else ""))
+    return done, per_cluster
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -207,16 +267,24 @@ def main():
     ap.add_argument("--cutoff", type=float, default=8.0,
                     help="Å; only residue pairs this close are stored (8.0 matches PPLM-Contact)")
     ap.add_argument("--seq-dir", help="PPLM PDB_seqs folder; maps are aligned onto its .fa sequences")
+    ap.add_argument("--per-cluster", type=int, help="keep at most N random pairs per PPLM cluster (default: all)")
+    ap.add_argument("--seed", type=int, default=0, help="which pairs --per-cluster keeps")
+    ap.add_argument("--retry-failed", action="store_true", help="when resuming, retry pairs that failed before")
     ap.add_argument("--cache", default=os.path.join(DATA_DIR, "cif_cache"))
     args = ap.parse_args()
 
     failed_path = args.output_jsonl + ".failed.txt"
-    if os.path.exists(failed_path):
-        os.remove(failed_path)  # don't leave a stale report from an earlier run
+    meta = {"input": os.path.abspath(args.input), "cutoff": args.cutoff,
+            "seq_dir": args.seq_dir and os.path.abspath(args.seq_dir),
+            "per_cluster": args.per_cluster, "seed": args.seed if args.per_cluster else None}
+    done, n_in_cluster = resume(args.output_jsonl, failed_path, meta, args.retry_failed)
 
-    n_ok, failed, structures = 0, [], {}
-    with open(args.output_jsonl, "w") as fout:
-        for p in read_pairs(args.input):
+    n_ok = n_failed = 0
+    structures = {}
+    with open(args.output_jsonl, "a") as fout, open(failed_path, "a") as ffail:
+        for p in read_pairs(args.input, args.per_cluster, args.seed):
+            if p["name"] in done or (args.per_cluster and n_in_cluster[p["cluster"]] >= args.per_cluster):
+                continue
             try:
                 key = (p["pdb_id"].lower(), p["assembly"])
                 if key not in structures:  # pairs from one entry share the download
@@ -246,15 +314,19 @@ def main():
                     "resolved1": res1.tolist(), "resolved2": res2.tolist(),
                     "contacts": [[int(i), int(j), round(float(x), 2)] for (i, j), x in zip(ij, d)],
                 }) + "\n")
+                fout.flush()  # so an interrupted run loses at most the pair in progress
                 n_ok += 1
+                n_in_cluster[p["cluster"]] += 1
             except Exception as e:  # keep going; report at the end
-                failed.append(f"{p['name']}\t{e}")
+                ffail.write(f"{p['name']}\t{' '.join(str(e).split())}\n")
+                ffail.flush()
+                n_failed += 1
 
-    print(f"labeled {n_ok} pairs, {len(failed)} failed")
-    if failed:
-        with open(failed_path, "w") as f:
-            f.write("\n".join(failed) + "\n")
+    print(f"labeled {n_ok} pairs, {n_failed} failed" + (f" (this run; {len(done)} done before)" if done else ""))
+    if os.path.getsize(failed_path):
         print(f"see {failed_path}")
+    else:
+        os.remove(failed_path)
 
 
 if __name__ == "__main__":
