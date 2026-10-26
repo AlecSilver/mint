@@ -3,8 +3,13 @@
 Extract per-residue MINT embeddings for labelled protein pairs, aligned with
 the per-residue interface labels from label_interfaces.py.
 
-Input: JSONL, one line per pair (trainset.json):
+Input: JSONL, one line per pair (trainset.json), either
+    from label_interfaces.py:
     {"id": ..., "cluster": ..., "seq1": ..., "seq2": ..., "labels1": [...], "labels2": [...]}
+    or from label_contacts.py (per-residue labels are derived from it: 1 = in any listed
+    contact, 0 = resolved, -1 = not):
+    {"id": ..., "cluster": ..., "seq1": ..., "seq2": ..., "resolved1": [...], "resolved2": [...],
+     "contacts": [[i, j, d], ...]}
 
 Both chains go through MINT together (chain_ids 0 / 1), so each residue's
 embedding is conditioned on its partner. Chains longer than --max-res residues
@@ -70,6 +75,8 @@ def read_pairs(path, limit=None):
             if not line:
                 continue
             rec = json.loads(line)
+            if "labels1" not in rec:
+                rec["labels1"], rec["labels2"] = labels_from_contacts(rec)
             if len(rec["seq1"]) != len(rec["labels1"]) or len(rec["seq2"]) != len(rec["labels2"]):
                 print(f"skipping {rec['id']}: sequence/label length mismatch")
                 continue
@@ -77,6 +84,14 @@ def read_pairs(path, limit=None):
             n += 1
             if limit and n >= limit:
                 return
+
+
+def labels_from_contacts(rec):
+    """Per-residue interface labels from a label_contacts.py record."""
+    labels = [[0 if r else -1 for r in rec["resolved1"]], [0 if r else -1 for r in rec["resolved2"]]]
+    for i, j, _ in rec["contacts"]:
+        labels[0][i], labels[1][j] = 1, 1
+    return labels
 
 
 def crop_window(seq_len, labels, max_res, mode, rng):
@@ -205,7 +220,7 @@ def check_meta(out_dir, meta):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("input", help="JSONL from label_interfaces.py (e.g. trainset.json)")
+    parser.add_argument("input", help="JSONL from label_interfaces.py or label_contacts.py")
     parser.add_argument("out_dir", help="directory for shard_XXXXX.pt files")
     parser.add_argument("--checkpoint", default=os.path.join(REPO_DIR, "mint.ckpt"))
     parser.add_argument("--config", default=os.path.join(REPO_DIR, "data", "esm2_t33_650M_UR50D.json"))
