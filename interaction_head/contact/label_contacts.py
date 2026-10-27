@@ -9,6 +9,7 @@ Input (either format):
 
 Output: JSONL, one line per pair:
     {"id": "5hrz-assembly1_B_C", "cluster": 17, "cutoff": 8.0,
+     "chains": ["A", "A-2"], "chain_match": "order",
      "seq1": "...", "seq2": "...", "resolved1": [...], "resolved2": [...],
      "contacts": [[i, j, d], ...]}
 
@@ -22,9 +23,21 @@ Rebuild dense (len(seq1), len(seq2)) arrays with
     contact_map(record, cutoff)   1 = within cutoff, 0 = farther, -1 = unknown
 (contact_map's cutoff defaults to the stored one and can only be lowered.)
 
+PPLM chain IDs are not the chain names in the RCSB assembly file: PPLM numbered the protein
+chains of each assembly A..Z, 0..9 in file order (so 6j5g's A, H, L, A-2, H-2, L-2 are PPLM's
+A..F), though not always. Pairs from a PPLM list are mapped that way; CSV chain IDs are used
+as given.
+
 With --seq-dir pointing at PPLM's PDB_seqs folder, seq1/seq2 are the sequences from
-<pair-chain>.fa and the map is aligned onto them. Without it, the full deposited
-(entity / SEQRES) sequence is used.
+<pair-chain>.fa and the map is aligned onto them. If a mapped chain's resolved residues don't
+match its .fa (modified and unknown residues such as MSE or UNK are not compared: PPLM's .fa
+sequences leave them out, so they end up unknown in the map), the pair is instead taken from
+the chains that do: of those pairs, the one with the most contacts (for homo-oligomers this
+may be a different interface than PPLM's). A chain that is mostly UNK / modified can't be
+checked and never matches.
+Without --seq-dir, the full deposited (entity / SEQRES) sequence is used and the mapping is
+unchecked. Each record's "chains" gives the file chains used and "chain_match" how they were
+picked ("order", "sequence" or, for CSV input, "given").
 
 Setup (separate, modern env; not the Python 3.7 MINT env):
     pip install gemmi scipy numpy
@@ -58,6 +71,8 @@ from scipy.spatial import cKDTree
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")  # interaction_head/data
 
 PAIR_RE =re.compile(r"([0-9A-Za-z]{4})-assembly(\d+)_([^_\s,;]+)_([^_\s,;]+)")
+PPLM_CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"  # PPLM's k-th protein chain of an assembly
+MIN_SEQ_MATCH = 0.9  # fraction of a chain's resolved standard residues that must align identically to its .fa
 
 
 # ---------------------------------------------------------------- input parsing
@@ -103,6 +118,13 @@ def load_structure(path):
     return st
 
 
+def pplm_chain_names(st):
+    """PPLM chain ID -> chain name in the assembly file (protein chains numbered in file order)."""
+    protein = [ch.name for ch in st[0] if ch.get_polymer().check_polymer_type()
+               in (gemmi.PolymerType.PeptideL, gemmi.PolymerType.PeptideD)]
+    return dict(zip(PPLM_CHAIN_IDS, protein))
+
+
 def one_letter(resname):
     """3-letter residue name -> 1-letter code; modified residues map to their parent (MSE -> M)."""
     info = gemmi.find_tabulated_residue(resname)
@@ -110,8 +132,18 @@ def one_letter(resname):
     return code if code.isalpha() else "X"
 
 
+def is_standard(resname):
+    """False for modified (MSE, TPO, SEP, ...) and unknown (UNK) residues, which PPLM's .fa
+    sequences leave out."""
+    info = gemmi.find_tabulated_residue(resname)
+    if info is None:
+        return True  # name not in gemmi's table: can't tell, so count it
+    return info.is_standard() and resname != "UNK"
+
+
 def chain_data(st, chain_id):
-    """Return (full entity sequence, heavy-atom coords, sequence index of each atom)."""
+    """Return (full entity sequence, per-position standard-residue mask, heavy-atom coords,
+    sequence index of each atom)."""
     chain = st[0].find_chain(chain_id)
     if chain is None:
         raise KeyError(f"chain {chain_id} not found")
@@ -120,7 +152,9 @@ def chain_data(st, chain_id):
     if entity is None or not entity.full_sequence:
         raise ValueError(f"no entity sequence for chain {chain_id}")
 
-    seq = "".join(one_letter(gemmi.Entity.first_mon(m)) for m in entity.full_sequence)
+    mons = [gemmi.Entity.first_mon(m) for m in entity.full_sequence]
+    seq = "".join(one_letter(m) for m in mons)
+    standard = np.array([is_standard(m) for m in mons])
 
     coords, atom_pos = [], []
     for res in polymer:
@@ -132,7 +166,7 @@ def chain_data(st, chain_id):
             atom_pos.append(idx)
     if not coords:
         raise ValueError(f"no atoms in chain {chain_id}")
-    return seq, np.asarray(coords), np.asarray(atom_pos)
+    return seq, standard, np.asarray(coords), np.asarray(atom_pos)
 
 
 def resolved_mask(seq, atom_pos):
@@ -201,6 +235,13 @@ def align_index(struct_seq, target_seq):
     return out
 
 
+def seq_match(checked, index):
+    """Fraction of the checked positions (resolved, standard residues) that align identically
+    to the target sequence; 0 if there are none."""
+    checked = checked.astype(bool)
+    return (index[checked] >= 0).mean() if checked.any() else 0.0
+
+
 def transfer_resolved(resolved, index, target_len):
     out = np.zeros(target_len, dtype=int)
     ok = index >= 0
@@ -212,6 +253,85 @@ def transfer_contacts(ij, d, index1, index2):
     i, j = index1[ij[:, 0]], index2[ij[:, 1]]
     ok = (i >= 0) & (j >= 0)
     return np.stack([i[ok], j[ok]], axis=1), d[ok]
+
+
+# ---------------------------------------------------------------- chain choice
+class ChainMismatch(ValueError):
+    pass
+
+
+class Assembly:
+    """A loaded structure plus per-chain data, computed once per chain."""
+    def __init__(self, st, pplm_ids):
+        self.st = st
+        self.names = pplm_chain_names(st) if pplm_ids else None
+        self._chains, self._matches = {}, {}
+
+    def chain(self, name):
+        """(seq, coords, atom_pos, resolved, checked) of a chain; checked = resolved standard
+        residues, the ones expected in the .fa (it leaves modified residues out)."""
+        if name not in self._chains:
+            seq, standard, xyz, pos = chain_data(self.st, name)
+            res = resolved_mask(seq, pos)
+            checked = res.astype(bool) & standard
+            if checked.sum() < 0.5 * res.sum():
+                checked[:] = False  # mostly UNK / modified: too little to tell which chain it is
+            self._chains[name] = seq, xyz, pos, res, checked
+        return self._chains[name]
+
+    def matching_chains(self, fa):
+        """Protein chains, in file order, whose resolved standard residues align to fa."""
+        if fa not in self._matches:
+            out = []
+            for name in self.names.values():
+                try:
+                    seq, _, _, _, checked = self.chain(name)
+                except (KeyError, ValueError):
+                    continue
+                if seq_match(checked, align_index(seq, fa)) >= MIN_SEQ_MATCH:
+                    out.append(name)
+            self._matches[fa] = out
+        return self._matches[fa]
+
+
+def label_chains(asm, c1, c2, fa1, fa2, cutoff):
+    """(seq1, seq2, res1, res2, ij, d) for file chains c1, c2, aligned onto fa1 / fa2 unless None."""
+    seq1, xyz1, pos1, res1, chk1 = asm.chain(c1)
+    seq2, xyz2, pos2, res2, chk2 = asm.chain(c2)
+    if fa1 is not None:
+        idx1, idx2 = align_index(seq1, fa1), align_index(seq2, fa2)
+        for c, chk, idx in ((c1, chk1, idx1), (c2, chk2, idx2)):
+            if (frac := seq_match(chk, idx)) < MIN_SEQ_MATCH:
+                raise ChainMismatch(f"chain {c} doesn't match its .fa sequence "
+                                    f"({frac:.0%} of resolved standard residues align)")
+    ij, d = residue_distances(pos1, xyz1, pos2, xyz2, cutoff)
+    if fa1 is not None:
+        res1, res2 = transfer_resolved(res1, idx1, len(fa1)), transfer_resolved(res2, idx2, len(fa2))
+        ij, d = transfer_contacts(ij, d, idx1, idx2)
+        seq1, seq2 = fa1, fa2
+    return seq1, seq2, res1, res2, ij, d
+
+
+def near(asm, c1, c2, cutoff):
+    """Cheap pre-check: do the two chains' bounding boxes come within cutoff?"""
+    a, b = asm.chain(c1)[1], asm.chain(c2)[1]
+    return np.all(a.min(0) - cutoff <= b.max(0)) and np.all(b.min(0) - cutoff <= a.max(0))
+
+
+def label_by_sequence(asm, fa1, fa2, cutoff):
+    """Fallback when PPLM's chain order can't be reproduced: of all chain pairs matching fa1 / fa2,
+    the one with the most contacts (first in file order on ties)."""
+    best = None
+    for c1 in asm.matching_chains(fa1):
+        for c2 in asm.matching_chains(fa2):
+            if c1 == c2 or not near(asm, c1, c2, cutoff):
+                continue
+            out = label_chains(asm, c1, c2, fa1, fa2, cutoff)
+            if best is None or len(out[4]) > len(best[1][4]):
+                best = (c1, c2), out
+    if best is None:
+        raise ChainMismatch("no pair of chains matching the .fa sequences is in contact")
+    return best
 
 
 # ---------------------------------------------------------------- resuming
@@ -276,7 +396,8 @@ def main():
     failed_path = args.output_jsonl + ".failed.txt"
     meta = {"input": os.path.abspath(args.input), "cutoff": args.cutoff,
             "seq_dir": args.seq_dir and os.path.abspath(args.seq_dir),
-            "per_cluster": args.per_cluster, "seed": args.seed if args.per_cluster else None}
+            "per_cluster": args.per_cluster, "seed": args.seed if args.per_cluster else None,
+            "chain_ids": "pplm-order"}  # older outputs looked PPLM chain IDs up by name
     done, n_in_cluster = resume(args.output_jsonl, failed_path, meta, args.retry_failed)
 
     n_ok = n_failed = 0
@@ -289,27 +410,37 @@ def main():
                 key = (p["pdb_id"].lower(), p["assembly"])
                 if key not in structures:  # pairs from one entry share the download
                     structures.clear()
-                    structures[key] = load_structure(fetch_cif(p["pdb_id"], p["assembly"], args.cache))
-                st = structures[key]
+                    st = load_structure(fetch_cif(p["pdb_id"], p["assembly"], args.cache))
+                    structures[key] = Assembly(st, pplm_ids=bool(p["assembly"]))
+                asm = structures[key]
 
-                seq1, xyz1, pos1 = chain_data(st, p["chain1"])
-                seq2, xyz2, pos2 = chain_data(st, p["chain2"])
-                res1, res2 = resolved_mask(seq1, pos1), resolved_mask(seq2, pos2)
-                ij, d = residue_distances(pos1, xyz1, pos2, xyz2, args.cutoff)
-
+                fa1 = fa2 = None
                 if args.seq_dir and p["assembly"]:
                     prefix = f"{p['pdb_id']}-assembly{p['assembly']}_"
                     fa1 = read_fasta(os.path.join(args.seq_dir, prefix + p["chain1"] + ".fa"))
                     fa2 = read_fasta(os.path.join(args.seq_dir, prefix + p["chain2"] + ".fa"))
-                    idx1, idx2 = align_index(seq1, fa1), align_index(seq2, fa2)
-                    res1, res2 = transfer_resolved(res1, idx1, len(fa1)), transfer_resolved(res2, idx2, len(fa2))
-                    ij, d = transfer_contacts(ij, d, idx1, idx2)
-                    seq1, seq2 = fa1, fa2
+
+                c1, c2, how = p["chain1"], p["chain2"], "given"
+                if asm.names is not None:
+                    c1, c2, how = asm.names.get(c1), asm.names.get(c2), "order"
+                try:
+                    if c1 is None or c2 is None:
+                        raise ChainMismatch(f"PPLM chain ID beyond the assembly's {len(asm.names)} protein chains")
+                    seq1, seq2, res1, res2, ij, d = label_chains(asm, c1, c2, fa1, fa2, args.cutoff)
+                except ChainMismatch as e:
+                    if fa1 is None:
+                        raise
+                    try:
+                        (c1, c2), (seq1, seq2, res1, res2, ij, d) = label_by_sequence(asm, fa1, fa2, args.cutoff)
+                    except ChainMismatch as e2:
+                        raise ChainMismatch(f"{e}; {e2}") from None
+                    how = "sequence"
 
                 if not len(ij):
                     raise ValueError("no contacts found at this cutoff")
                 fout.write(json.dumps({
                     "id": p["name"], "cluster": p["cluster"], "cutoff": args.cutoff,
+                    "chains": [c1, c2], "chain_match": how,
                     "seq1": seq1, "seq2": seq2,
                     "resolved1": res1.tolist(), "resolved2": res2.tolist(),
                     "contacts": [[int(i), int(j), round(float(x), 2)] for (i, j), x in zip(ij, d)],
